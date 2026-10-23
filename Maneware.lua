@@ -1,509 +1,574 @@
-
--- Mobile Neon GUI | Roblox Lua
--- Mobile-first interface with Combat / Move / Visual tabs
--- UI and settings are functional; gameplay handlers are placeholders.
+--[[
+    Maneware Target Module (all-in-one, Delta mobile)
+    Target Strafe | Strafe | Target ESP (Circle + Cube) | No Push
+    Свой красивый GUI внутри. Кнопка "M" открывает/закрывает меню.
+    Настройки доступны из других скриптов через getgenv().ManeTarget
+]]
 
 local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
 local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
 
-local old = playerGui:FindFirstChild("MobileNeonUI")
-if old then old:Destroy() end
-
-local C = {
-    bg = Color3.fromRGB(13, 15, 24),
-    panel = Color3.fromRGB(21, 24, 37),
-    element = Color3.fromRGB(30, 34, 51),
-    accent = Color3.fromRGB(0, 220, 190),
-    purple = Color3.fromRGB(143, 95, 255),
-    white = Color3.fromRGB(239, 242, 255),
-    muted = Color3.fromRGB(139, 148, 171),
-    red = Color3.fromRGB(255, 92, 115)
-}
+-- повторный запуск: убираем старую копию
+local env = (getgenv and getgenv()) or _G
+if env.ManeTargetCleanup then pcall(env.ManeTargetCleanup) end
 
 local settings = {
-    TargetStrafe = false,
-    Speed = 16,
-    Distance = 2,
+    TargetStrafe = false, Distance = 8, Speed = 20,
+    Strafe = false, StrafeSpeed = 32,
+    TargetESP_Circle = false, TargetESP_CircleSpeed = 5,
+    TargetESP_Cube = false, TargetESP_Speed = 5,
     NoPush = false,
-    Players = true
 }
+env.ManeTarget = settings
 
-local gui = Instance.new("ScreenGui")
-gui.Name = "MobileNeonUI"
+local conns = {}
+local function keep(c) conns[#conns + 1] = c return c end
+
+local gui
+local autoRotateChanged = false
+
+-- ==========================================
+-- TARGET ESP OBJECTS
+-- ==========================================
+local ESP_COLOR = Color3.fromRGB(255, 60, 90)
+local BEADS, RING_RADIUS = 20, 2.2
+
+local espFolder = Instance.new("Folder")
+espFolder.Name = "TargetESP"
+espFolder.Parent = Workspace.CurrentCamera
+
+local function newPart(size, shape)
+    local p = Instance.new("Part")
+    p.Size = size
+    if shape then p.Shape = shape end
+    p.Material = Enum.Material.Neon
+    p.Color = ESP_COLOR
+    p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = true, false, false, false, false
+    return p
+end
+
+local circleObj, cubeObj
+local function ensureCircle()
+    if circleObj then return end
+    local f = Instance.new("Folder")
+    f.Name = "Circle"
+    local beads = {}
+    for i = 1, BEADS do
+        local b = newPart(Vector3.new(0.35, 0.35, 0.35), Enum.PartType.Ball)
+        b.Parent = f
+        beads[i] = b
+    end
+    circleObj = {Folder = f, Beads = beads}
+end
+local function ensureCube()
+    if cubeObj then return end
+    local p = newPart(Vector3.new(1.6, 1.6, 1.6))
+    p.Transparency = 0.35
+    local sb = Instance.new("SelectionBox")
+    sb.Adornee = p
+    sb.LineThickness = 0.04
+    sb.Color3 = ESP_COLOR
+    sb.SurfaceTransparency = 1
+    sb.Parent = p
+    cubeObj = p
+end
+local function killCircle() if circleObj then circleObj.Folder:Destroy() circleObj = nil end end
+local function killCube() if cubeObj then cubeObj:Destroy() cubeObj = nil end end
+
+local function getClosestPlayer(myPos)
+    local closest, minDist = nil, math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character then
+            local h = p.Character:FindFirstChild("HumanoidRootPart")
+            local hm = p.Character:FindFirstChildOfClass("Humanoid")
+            if h and hm and hm.Health > 0 then
+                local d = (h.Position - myPos).Magnitude
+                if d < minDist then minDist, closest = d, p end
+            end
+        end
+    end
+    return closest
+end
+
+-- ==========================================
+-- CLEANUP
+-- ==========================================
+env.ManeTargetCleanup = function()
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    killCircle() killCube()
+    if espFolder then espFolder:Destroy() end
+    if gui then gui:Destroy() end
+    local ch = player.Character
+    local hm = ch and ch:FindFirstChildOfClass("Humanoid")
+    if hm and autoRotateChanged then hm.AutoRotate = true end
+end
+
+-- ==========================================
+-- GUI
+-- ==========================================
+local BG = Color3.fromRGB(18, 18, 27)
+local BG2 = Color3.fromRGB(28, 28, 42)
+local ACCENT = Color3.fromRGB(150, 110, 255)
+local ACCENT2 = Color3.fromRGB(90, 60, 200)
+local TEXT = Color3.fromRGB(235, 235, 245)
+local MUTED = Color3.fromRGB(150, 150, 172)
+local OFF = Color3.fromRGB(52, 52, 74)
+
+gui = Instance.new("ScreenGui")
+gui.Name = "ManeTarget"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
-gui.DisplayOrder = 20
-gui.Parent = playerGui
-
-local function corner(obj, radius)
-    local v = Instance.new("UICorner")
-    v.CornerRadius = UDim.new(0, radius or 12)
-    v.Parent = obj
+gui.DisplayOrder = 999
+local okParent = pcall(function()
+    gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+end)
+if not okParent or not gui.Parent then
+    gui.Parent = player:WaitForChild("PlayerGui")
 end
 
-local function stroke(obj, color, thickness)
+local function corner(o, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r)
+    c.Parent = o
+    return c
+end
+local function stroke(o, color, tr, th)
     local s = Instance.new("UIStroke")
-    s.Color = color or C.accent
-    s.Thickness = thickness or 1
-    s.Transparency = 0.25
-    s.Parent = obj
+    s.Color = color or ACCENT
+    s.Transparency = tr or 0.6
+    s.Thickness = th or 1
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Parent = o
+    return s
+end
+local function label(parent, txt, size, color, font, align)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Text = txt
+    l.TextSize = size
+    l.TextColor3 = color
+    l.Font = font or Enum.Font.GothamMedium
+    l.TextXAlignment = align or Enum.TextXAlignment.Left
+    l.Parent = parent
+    return l
+end
+local function tween(o, t, props)
+    TweenService:Create(o, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
 end
 
-local function make(class, props, parent)
-    local obj = Instance.new(class)
-    for k, v in pairs(props) do
-        obj[k] = v
+local function isPress(i)
+    return i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1
+end
+local function isMove(i)
+    return i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseMovement
+end
+
+-- перетаскивание (+ onTap, если это был просто тап)
+local function draggable(handle, frame, onTap)
+    local dragging, dragStart, startPos, moved = false, nil, nil, false
+    keep(handle.InputBegan:Connect(function(i)
+        if isPress(i) then
+            dragging, moved = true, false
+            dragStart, startPos = i.Position, frame.Position
+        end
+    end))
+    keep(UserInputService.InputChanged:Connect(function(i)
+        if dragging and isMove(i) then
+            local d = i.Position - dragStart
+            if d.Magnitude > 8 then moved = true end
+            if moved then
+                frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                    startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end
+    end))
+    keep(UserInputService.InputEnded:Connect(function(i)
+        if dragging and isPress(i) then
+            dragging = false
+            if not moved and onTap then onTap() end
+        end
+    end))
+end
+
+-- окно
+local window = Instance.new("Frame")
+window.Name = "Window"
+window.AnchorPoint = Vector2.new(0.5, 0.5)
+window.Position = UDim2.new(0.5, 0, 0.5, 0)
+window.Size = UDim2.fromOffset(290, 330)
+window.BackgroundColor3 = BG
+window.BorderSizePixel = 0
+window.ClipsDescendants = true
+window.Parent = gui
+corner(window, 14)
+local winStroke = stroke(window, ACCENT, 0.2, 1.5)
+local strokeGrad = Instance.new("UIGradient")
+strokeGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, ACCENT),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 90, 150)),
+    ColorSequenceKeypoint.new(1, ACCENT),
+})
+strokeGrad.Parent = winStroke
+local winScale = Instance.new("UIScale")
+winScale.Parent = window
+
+-- шапка
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 42)
+header.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+header.BorderSizePixel = 0
+header.Parent = window
+local hg = Instance.new("UIGradient")
+hg.Color = ColorSequence.new(ACCENT, ACCENT2)
+hg.Rotation = 20
+hg.Parent = header
+
+local title = label(header, "MANEWARE  •  Target", 15, Color3.fromRGB(255, 255, 255), Enum.Font.GothamBold)
+title.Position = UDim2.new(0, 14, 0, 0)
+title.Size = UDim2.new(1, -60, 1, 0)
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.fromOffset(28, 28)
+closeBtn.Position = UDim2.new(1, -36, 0.5, -14)
+closeBtn.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+closeBtn.BackgroundTransparency = 0.7
+closeBtn.Text = "–"
+closeBtn.TextSize = 18
+closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.AutoButtonColor = false
+closeBtn.Parent = header
+corner(closeBtn, 8)
+
+-- список
+local scroll = Instance.new("ScrollingFrame")
+scroll.Position = UDim2.new(0, 0, 0, 42)
+scroll.Size = UDim2.new(1, 0, 1, -42)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 3
+scroll.ScrollBarImageColor3 = ACCENT
+scroll.CanvasSize = UDim2.new()
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.Parent = window
+local pad = Instance.new("UIPadding")
+pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 10), UDim.new(0, 10)
+pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 10), UDim.new(0, 12)
+pad.Parent = scroll
+local list = Instance.new("UIListLayout")
+list.Padding = UDim.new(0, 8)
+list.SortOrder = Enum.SortOrder.LayoutOrder
+list.Parent = scroll
+
+local order = 0
+local function add(f) order += 1 f.LayoutOrder = order end
+
+local function section(txt)
+    local l = label(scroll, txt, 11, ACCENT, Enum.Font.GothamBold)
+    l.Size = UDim2.new(1, 0, 0, 18)
+    add(l)
+end
+
+local function makeToggle(txt, key)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, 0, 0, 42)
+    f.BackgroundColor3 = BG2
+    f.BorderSizePixel = 0
+    f.Parent = scroll
+    corner(f, 10)
+    stroke(f, ACCENT, 0.8)
+    add(f)
+
+    local l = label(f, txt, 14, TEXT)
+    l.Position = UDim2.new(0, 12, 0, 0)
+    l.Size = UDim2.new(1, -70, 1, 0)
+
+    local track = Instance.new("Frame")
+    track.Size = UDim2.fromOffset(44, 22)
+    track.Position = UDim2.new(1, -56, 0.5, -11)
+    track.BackgroundColor3 = OFF
+    track.BorderSizePixel = 0
+    track.Parent = f
+    corner(track, 11)
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(18, 18)
+    knob.Position = UDim2.new(0, 2, 0.5, -9)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    knob.Parent = track
+    corner(knob, 9)
+
+    local function refresh()
+        local on = settings[key]
+        tween(track, 0.15, {BackgroundColor3 = on and ACCENT or OFF})
+        tween(knob, 0.15, {Position = on and UDim2.new(1, -20, 0.5, -9) or UDim2.new(0, 2, 0.5, -9)})
     end
-    obj.Parent = parent
-    return obj
+    refresh()
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.BackgroundTransparency = 1
+    btn.Text = ""
+    btn.Parent = f
+    keep(btn.Activated:Connect(function()
+        settings[key] = not settings[key]
+        refresh()
+    end))
 end
 
-local main = make("Frame", {
-    Name = "Main",
-    AnchorPoint = Vector2.new(0.5, 0.5),
-    Position = UDim2.fromScale(0.5, 0.5),
-    Size = UDim2.fromScale(0.88, 0.72),
-    BackgroundColor3 = C.bg,
-    BorderSizePixel = 0,
-    ClipsDescendants = true
-}, gui)
+local function makeSlider(txt, key, min, max, step)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, 0, 0, 56)
+    f.BackgroundColor3 = BG2
+    f.BorderSizePixel = 0
+    f.Parent = scroll
+    corner(f, 10)
+    stroke(f, ACCENT, 0.8)
+    add(f)
 
-main.Size = UDim2.new(
-    0.88, 0,
-    0, math.min(510, workspace.CurrentCamera.ViewportSize.Y * 0.78)
-)
-corner(main, 18)
-stroke(main, C.purple, 1.5)
+    local l = label(f, txt, 13, TEXT)
+    l.Position = UDim2.new(0, 12, 0, 6)
+    l.Size = UDim2.new(0.6, 0, 0, 18)
+    local val = label(f, "", 13, ACCENT, Enum.Font.GothamBold, Enum.TextXAlignment.Right)
+    val.Position = UDim2.new(0.5, 0, 0, 6)
+    val.Size = UDim2.new(0.5, -12, 0, 18)
 
-make("UIGradient", {
-    Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, C.bg),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(24, 20, 42))
-    }),
-    Rotation = 35
-}, main)
+    local track = Instance.new("Frame")
+    track.Size = UDim2.new(1, -28, 0, 6)
+    track.Position = UDim2.new(0, 14, 0, 36)
+    track.BackgroundColor3 = OFF
+    track.BorderSizePixel = 0
+    track.Parent = f
+    corner(track, 3)
+    local fill = Instance.new("Frame")
+    fill.BackgroundColor3 = ACCENT
+    fill.BorderSizePixel = 0
+    fill.Parent = track
+    corner(fill, 3)
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(16, 16)
+    knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    knob.ZIndex = 2
+    knob.Parent = track
+    corner(knob, 8)
 
--- Header
-local header = make("Frame", {
-    Size = UDim2.new(1, 0, 0, 65),
-    BackgroundColor3 = C.panel,
-    BorderSizePixel = 0
-}, main)
-
-local title = make("TextLabel", {
-    Position = UDim2.new(0, 16, 0, 7),
-    Size = UDim2.new(1, -65, 0, 29),
-    BackgroundTransparency = 1,
-    Text = "N E O N   /   M O B I L E",
-    TextColor3 = C.white,
-    TextSize = 16,
-    Font = Enum.Font.GothamBold,
-    TextXAlignment = Enum.TextXAlignment.Left
-}, header)
-
-make("TextLabel", {
-    Position = UDim2.new(0, 17, 0, 35),
-    Size = UDim2.new(1, -70, 0, 18),
-    BackgroundTransparency = 1,
-    Text = "UNIVERSAL INTERFACE  •  V1.0",
-    TextColor3 = C.muted,
-    TextSize = 9,
-    Font = Enum.Font.GothamMedium,
-    TextXAlignment = Enum.TextXAlignment.Left
-}, header)
-
-local close = make("TextButton", {
-    AnchorPoint = Vector2.new(1, 0.5),
-    Position = UDim2.new(1, -12, 0.5, 0),
-    Size = UDim2.fromOffset(34, 34),
-    BackgroundColor3 = Color3.fromRGB(54, 30, 47),
-    Text = "×",
-    TextColor3 = C.red,
-    TextSize = 24,
-    Font = Enum.Font.GothamBold,
-    AutoButtonColor = false
-}, header)
-corner(close, 10)
-
-close.Activated:Connect(function()
-    gui:Destroy()
-end)
-
--- Drag header with mouse or touch
-local dragging, dragStart, startPos
-
-header.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true
-        dragStart = input.Position
-        startPos = main.Position
+    local function set(v)
+        v = math.clamp(math.floor(v / step + 0.5) * step, min, max)
+        settings[key] = v
+        local r = (v - min) / (max - min)
+        fill.Size = UDim2.new(r, 0, 1, 0)
+        knob.Position = UDim2.new(r, 0, 0.5, 0)
+        val.Text = tostring(math.floor(v * 100 + 0.5) / 100)
     end
-end)
+    set(settings[key])
 
-UserInputService.InputChanged:Connect(function(input)
-    if dragging and (
-        input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch
-    ) then
-        local delta = input.Position - dragStart
-        main.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + delta.X,
-            startPos.Y.Scale, startPos.Y.Offset + delta.Y
-        )
-    end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = false
-    end
-end)
-
--- Tabs
-local tabBar = make("Frame", {
-    Position = UDim2.new(0, 10, 0, 76),
-    Size = UDim2.new(1, -20, 0, 43),
-    BackgroundColor3 = C.panel,
-    BorderSizePixel = 0
-}, main)
-corner(tabBar, 12)
-
-local tabNames = {"Combat", "Move", "Visual"}
-local tabButtons = {}
-local pages = {}
-
-local body = make("Frame", {
-    Position = UDim2.new(0, 10, 0, 128),
-    Size = UDim2.new(1, -20, 1, -140),
-    BackgroundTransparency = 1
-}, main)
-
-for i, name in ipairs(tabNames) do
-    local button = make("TextButton", {
-        Position = UDim2.new((i - 1) / 3, 3, 0, 3),
-        Size = UDim2.new(1 / 3, -6, 1, -6),
-        BackgroundColor3 = C.panel,
-        Text = name,
-        TextColor3 = C.muted,
-        TextSize = 12,
-        Font = Enum.Font.GothamBold,
-        AutoButtonColor = false
-    }, tabBar)
-    corner(button, 9)
-    tabButtons[name] = button
-
-    local page = make("ScrollingFrame", {
-        Name = name .. "Page",
-        Size = UDim2.fromScale(1, 1),
-        BackgroundTransparency = 1,
-        BorderSizePixel = 0,
-        ScrollBarThickness = 3,
-        ScrollBarImageColor3 = C.accent,
-        CanvasSize = UDim2.new(),
-        AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        Visible = false
-    }, body)
-
-    make("UIListLayout", {
-        Padding = UDim.new(0, 10),
-        SortOrder = Enum.SortOrder.LayoutOrder
-    }, page)
-
-    make("UIPadding", {
-        PaddingTop = UDim.new(0, 3),
-        PaddingBottom = UDim.new(0, 8),
-        PaddingLeft = UDim.new(0, 2),
-        PaddingRight = UDim.new(0, 5)
-    }, page)
-
-    pages[name] = page
-end
-
-local function selectTab(name)
-    for tab, page in pairs(pages) do
-        local active = tab == name
-        page.Visible = active
-        tabButtons[tab].BackgroundColor3 =
-            active and C.accent or C.panel
-        tabButtons[tab].TextColor3 =
-            active and C.bg or C.muted
-    end
-end
-
-for name, button in pairs(tabButtons) do
-    button.Activated:Connect(function()
-        selectTab(name)
-    end)
-end
-
-local function section(page, text)
-    local label = make("TextLabel", {
-        Size = UDim2.new(1, -4, 0, 27),
-        BackgroundTransparency = 1,
-        Text = "  " .. string.upper(text),
-        TextColor3 = C.accent,
-        TextSize = 11,
-        Font = Enum.Font.GothamBold,
-        TextXAlignment = Enum.TextXAlignment.Left
-    }, page)
-    return label
-end
-
-local function card(page, height)
-    local f = make("Frame", {
-        Size = UDim2.new(1, -4, 0, height or 58),
-        BackgroundColor3 = C.panel,
-        BorderSizePixel = 0
-    }, page)
-    corner(f, 12)
-    stroke(f, C.element, 1)
-    return f
-end
-
-local function toggle(page, label, initial, callback)
-    local f = card(page, 58)
-
-    make("TextLabel", {
-        Position = UDim2.new(0, 13, 0, 0),
-        Size = UDim2.new(1, -85, 1, 0),
-        BackgroundTransparency = 1,
-        Text = label,
-        TextColor3 = C.white,
-        TextSize = 13,
-        Font = Enum.Font.GothamMedium,
-        TextXAlignment = Enum.TextXAlignment.Left
-    }, f)
-
-    local b = make("TextButton", {
-        Position = UDim2.new(1, -60, 0.5, -13),
-        Size = UDim2.fromOffset(47, 26),
-        BackgroundColor3 = initial and C.accent or C.element,
-        Text = "",
-        AutoButtonColor = false
-    }, f)
-    corner(b, 13)
-
-    local knob = make("Frame", {
-        Position = initial and UDim2.new(1, -22, 0, 4)
-            or UDim2.new(0, 4, 0, 4),
-        Size = UDim2.fromOffset(18, 18),
-        BackgroundColor3 = C.white,
-        BorderSizePixel = 0
-    }, b)
-    corner(knob, 10)
-
-    local state = initial
-
-    local function update(value)
-        state = value
-        b.BackgroundColor3 = state and C.accent or C.element
-        TweenService:Create(knob, TweenInfo.new(0.15), {
-            Position = state and UDim2.new(1, -22, 0, 4)
-                or UDim2.new(0, 4, 0, 4)
-        }):Play()
-        callback(state)
-    end
-
-    b.Activated:Connect(function()
-        update(not state)
-    end)
-
-    return {
-        Set = update,
-        Get = function() return state end
-    }
-end
-
-local function slider(page, label, min, max, initial, callback)
-    local f = card(page, 80)
-
-    local valueLabel = make("TextLabel", {
-        Position = UDim2.new(0, 13, 0, 7),
-        Size = UDim2.new(0.65, 0, 0, 22),
-        BackgroundTransparency = 1,
-        Text = label,
-        TextColor3 = C.white,
-        TextSize = 13,
-        Font = Enum.Font.GothamMedium,
-        TextXAlignment = Enum.TextXAlignment.Left
-    }, f)
-
-    local number = make("TextLabel", {
-        Position = UDim2.new(1, -75, 0, 7),
-        Size = UDim2.new(0, 60, 0, 22),
-        BackgroundTransparency = 1,
-        TextColor3 = C.accent,
-        TextSize = 13,
-        Font = Enum.Font.GothamBold,
-        TextXAlignment = Enum.TextXAlignment.Right
-    }, f)
-
-    local track = make("Frame", {
-        Position = UDim2.new(0, 13, 0, 47),
-        Size = UDim2.new(1, -26, 0, 6),
-        BackgroundColor3 = C.element,
-        BorderSizePixel = 0
-    }, f)
-    corner(track, 6)
-
-    local fill = make("Frame", {
-        Size = UDim2.new(0, 0, 1, 0),
-        BackgroundColor3 = C.accent,
-        BorderSizePixel = 0
-    }, track)
-    corner(fill, 6)
-
-    local knob = make("Frame", {
-        AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.new(0, 0, 0.5, 0),
-        Size = UDim2.fromOffset(16, 16),
-        BackgroundColor3 = C.white,
-        BorderSizePixel = 0
-    }, track)
-    corner(knob, 10)
-    stroke(knob, C.accent, 1)
-
-    local value = initial
-    local active = false
-
-    local function setValue(v)
-        value = math.clamp(math.floor(v + 0.5), min, max)
-        local alpha = (value - min) / (max - min)
-        fill.Size = UDim2.new(alpha, 0, 1, 0)
-        knob.Position = UDim2.new(alpha, 0, 0.5, 0)
-        number.Text = tostring(value)
-        callback(value)
-    end
-
+    local dragging = false
     local function fromX(x)
-        local alpha = math.clamp(
-            (x - track.AbsolutePosition.X) / track.AbsoluteSize.X,
-            0, 1
-        )
-        setValue(min + alpha * (max - min))
+        local r = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+        set(min + (max - min) * r)
     end
-
-    local hit = make("TextButton", {
-        Position = UDim2.new(0, 0, 0, 32),
-        Size = UDim2.new(1, 0, 0, 36),
-        BackgroundTransparency = 1,
-        Text = "",
-        AutoButtonColor = false
-    }, f)
-
-    hit.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch
-            or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            active = true
-            fromX(input.Position.X)
+    local hit = Instance.new("TextButton")
+    hit.Size = UDim2.new(1, 0, 0, 30)
+    hit.Position = UDim2.new(0, 0, 1, -30)
+    hit.BackgroundTransparency = 1
+    hit.Text = ""
+    hit.Parent = f
+    keep(hit.InputBegan:Connect(function(i)
+        if isPress(i) then
+            dragging = true
+            scroll.ScrollingEnabled = false
+            fromX(i.Position.X)
         end
-    end)
-
-    UserInputService.InputChanged:Connect(function(input)
-        if active and (
-            input.UserInputType == Enum.UserInputType.Touch
-            or input.UserInputType == Enum.UserInputType.MouseMovement
-        ) then
-            fromX(input.Position.X)
+    end))
+    keep(UserInputService.InputChanged:Connect(function(i)
+        if dragging and isMove(i) then fromX(i.Position.X) end
+    end))
+    keep(UserInputService.InputEnded:Connect(function(i)
+        if dragging and isPress(i) then
+            dragging = false
+            scroll.ScrollingEnabled = true
         end
-    end)
-
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch
-            or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            active = false
-        end
-    end)
-
-    setValue(initial)
+    end))
 end
 
--- COMBAT TAB
-local combat = pages.Combat
-section(combat, "Combat modules")
+section("TARGET STRAFE")
+makeToggle("Target Strafe", "TargetStrafe")
+makeSlider("Дистанция", "Distance", 3, 25, 0.5)
+makeSlider("Скорость орбиты", "Speed", 5, 80, 1)
 
-local combatToggle = toggle(combat, "Combat module", false, function(v)
-    print("Combat module:", v)
-end)
+section("STRAFE")
+makeToggle("Strafe", "Strafe")
+makeSlider("Скорость Strafe", "StrafeSpeed", 16, 120, 1)
 
-local aimToggle = toggle(combat, "Aim assist UI", false, function(v)
-    print("Aim assist setting:", v)
-end)
+section("TARGET ESP")
+makeToggle("Circle (голова → ноги)", "TargetESP_Circle")
+makeSlider("Скорость круга", "TargetESP_CircleSpeed", 1, 20, 0.5)
+makeToggle("Cube", "TargetESP_Cube")
+makeSlider("Скорость куба", "TargetESP_Speed", 1, 20, 0.5)
 
-local note = card(combat, 66)
-make("TextLabel", {
-    Position = UDim2.new(0, 12, 0, 6),
-    Size = UDim2.new(1, -24, 1, -12),
-    BackgroundTransparency = 1,
-    Text = "Combat controls are interface placeholders.\nConnect only to mechanics in your own experience.",
-    TextWrapped = true,
-    TextColor3 = C.muted,
-    TextSize = 11,
-    Font = Enum.Font.Gotham,
-    TextXAlignment = Enum.TextXAlignment.Left
-}, note)
+section("MISC")
+makeToggle("No Push", "NoPush")
 
--- MOVE TAB
-local move = pages.Move
-section(move, "Movement")
+-- кнопка "M"
+local fab = Instance.new("TextButton")
+fab.Size = UDim2.fromOffset(46, 46)
+fab.Position = UDim2.new(0, 14, 0, 90)
+fab.BackgroundColor3 = ACCENT
+fab.Text = "M"
+fab.TextSize = 20
+fab.TextColor3 = Color3.fromRGB(255, 255, 255)
+fab.Font = Enum.Font.GothamBold
+fab.AutoButtonColor = false
+fab.Parent = gui
+corner(fab, 23)
+stroke(fab, Color3.fromRGB(255, 255, 255), 0.6, 1.5)
+local fg = Instance.new("UIGradient")
+fg.Color = ColorSequence.new(ACCENT, ACCENT2)
+fg.Rotation = 45
+fg.Parent = fab
 
-toggle(move, "TargetStrafe", settings.TargetStrafe, function(v)
-    settings.TargetStrafe = v
-    print("TargetStrafe setting:", v)
-end)
+local isOpen = true
+local function setOpen(v)
+    isOpen = v
+    if v then
+        window.Visible = true
+        winScale.Scale = 0.9
+        tween(winScale, 0.18, {Scale = 1})
+    else
+        window.Visible = false
+    end
+end
+keep(closeBtn.Activated:Connect(function() setOpen(false) end))
+draggable(fab, fab, function() setOpen(not isOpen) end)
+draggable(header, window)
 
-slider(move, "Speed (studs)", 1, 50, settings.Speed, function(v)
-    settings.Speed = v
-    print("Speed setting:", v)
-end)
+-- ==========================================
+-- LOGIC
+-- ==========================================
+local target, acc = nil, 0
+local cubeAngle, circleAngle, scanTime, strafeAngle = 0, 0, 0, 0
+local noPushApplied = false
 
-slider(move, "Distance (studs)", 0, 5, settings.Distance, function(v)
-    settings.Distance = v
-    print("Distance setting:", v)
-end)
+keep(RunService.Heartbeat:Connect(function(dt)
+    -- анимация рамки меню
+    strokeGrad.Rotation = (tick() * 60) % 360
 
-section(move, "Collision")
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then
+        killCircle() killCube()
+        return
+    end
 
-toggle(move, "NoPush", settings.NoPush, function(v)
-    settings.NoPush = v
-    print("NoPush setting:", v)
-end)
+    -- цель обновляем 4 раза в секунду
+    acc += dt
+    if acc >= 0.25 then
+        acc = 0
+        if settings.TargetStrafe or settings.TargetESP_Circle or settings.TargetESP_Cube then
+            target = getClosestPlayer(hrp.Position)
+        else
+            target = nil
+        end
 
-toggle(move, "Players", settings.Players, function(v)
-    settings.Players = v
-    print("Players setting:", v)
-end)
+        if settings.NoPush then
+            noPushApplied = true
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CustomPhysicalProperties = PhysicalProperties.new(100, 0.3, 0.5)
+                end
+            end
+        elseif noPushApplied then
+            noPushApplied = false
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then part.CustomPhysicalProperties = nil end
+            end
+        end
+    end
 
--- VISUAL TAB
-local visual = pages.Visual
-section(visual, "Interface")
+    local tChar = target and target.Character
+    local tHRP = tChar and tChar:FindFirstChild("HumanoidRootPart")
+    local tHead = tChar and tChar:FindFirstChild("Head")
+    local tHum = tChar and tChar:FindFirstChildOfClass("Humanoid")
+    local valid = tHRP and tHead and tHum and tHum.Health > 0
 
-toggle(visual, "Accent animation", true, function(v)
-    print("Accent animation setting:", v)
-end)
+    -- TARGET STRAFE
+    if settings.TargetStrafe and valid then
+        strafeAngle += dt * (settings.Speed / 10)
+        local goal = tHRP.Position + Vector3.new(math.cos(strafeAngle), 0, math.sin(strafeAngle)) * settings.Distance
+        local goalCF = CFrame.lookAt(goal, tHRP.Position)
+        hum.AutoRotate = false
+        autoRotateChanged = true
+        hrp.CFrame = hrp.CFrame:Lerp(goalCF, math.min(1, dt * 20))
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    else
+        if autoRotateChanged then
+            hum.AutoRotate = true
+            autoRotateChanged = false
+        end
+        -- STRAFE
+        if settings.Strafe then
+            local md = hum.MoveDirection
+            if md.Magnitude > 0.05 then
+                local v = hrp.AssemblyLinearVelocity
+                local sp = settings.StrafeSpeed
+                hrp.AssemblyLinearVelocity = Vector3.new(md.X * sp, v.Y, md.Z * sp)
+            end
+        end
+    end
 
-toggle(visual, "Show status", true, function(v)
-    title.Visible = v
-end)
+    -- TARGET ESP: CIRCLE (макушка → пятки)
+    if settings.TargetESP_Circle then
+        ensureCircle()
+        if valid then
+            circleAngle += dt * settings.TargetESP_CircleSpeed
+            scanTime += dt * (settings.TargetESP_CircleSpeed / 3)
 
-local info = card(visual, 62)
-make("TextLabel", {
-    Position = UDim2.new(0, 12, 0, 0),
-    Size = UDim2.new(1, -24, 1, 0),
-    BackgroundTransparency = 1,
-    Text = "NEON UI  /  MOBILE\nTouch-friendly • Draggable • Resizable layout",
-    TextColor3 = C.muted,
-    TextSize = 11,
-    Font = Enum.Font.GothamMedium,
-    TextWrapped = true,
-    TextXAlignment = Enum.TextXAlignment.Left
-}, info)
+            local topY = tHead.Position.Y + tHead.Size.Y / 2
+            local bottomY
+            if tHum.RigType == Enum.HumanoidRigType.R15 then
+                bottomY = tHRP.Position.Y - tHRP.Size.Y / 2 - tHum.HipHeight
+            else
+                bottomY = tHRP.Position.Y - 3
+            end
+            local alpha = (math.sin(scanTime) + 1) / 2
+            local y = bottomY + (topY - bottomY) * alpha
 
-selectTab("Move")
-print("Mobile Neon GUI loaded.")
+            local cx, cz = tHRP.Position.X, tHRP.Position.Z
+            for i, b in ipairs(circleObj.Beads) do
+                local a = circleAngle + (i / BEADS) * math.pi * 2
+                b.Position = Vector3.new(cx + math.cos(a) * RING_RADIUS, y, cz + math.sin(a) * RING_RADIUS)
+            end
+            circleObj.Folder.Parent = espFolder
+        else
+            circleObj.Folder.Parent = nil
+        end
+    else
+        killCircle()
+    end
+
+    -- TARGET ESP: CUBE
+    if settings.TargetESP_Cube then
+        ensureCube()
+        if valid then
+            cubeAngle += dt * settings.TargetESP_Speed
+            local pos = Vector3.new(
+                tHead.Position.X,
+                tHead.Position.Y + tHead.Size.Y / 2 + 2.2 + math.sin(tick() * 2) * 0.3,
+                tHead.Position.Z
+            )
+            cubeObj.CFrame = CFrame.new(pos) * CFrame.Angles(cubeAngle, cubeAngle * 0.7, 0)
+            cubeObj.Parent = espFolder
+        else
+            cubeObj.Parent = nil
+        end
+    else
+        killCube()
+    end
+end))
